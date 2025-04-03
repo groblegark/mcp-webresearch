@@ -886,30 +886,114 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                     // Step 5: Extract search results
                     const searchResults = await withRetry(async () => {
                         const results = await page.evaluate(() => {
-                            // Find all search result containers
-                            const elements = document.querySelectorAll('div.g');
+                            // Find all search result containers - try multiple selectors
+                            let elements = document.querySelectorAll('div.g');
+                            
+                            // If the primary selector doesn't work, try alternative selectors
                             if (!elements || elements.length === 0) {
-                                throw new Error('No search results found');
+                                console.log('Primary selector failed, trying alternatives');
+                                // Try alternative selectors for Google search results
+                                const alternativeSelectors = [
+                                    'div[data-soar-id]', // Newer Google results
+                                    'div[jscontroller][data-hveid]', // Alternative selector
+                                    'div[jscontroller][jsaction][jsdata]', // Another pattern
+                                    'div.MjjYud', // Another common container class
+                                    'div.g div', // Nested elements
+                                    'div[jsname]', // Generic jsname attribute
+                                    'div.rc', // Classic result container
+                                ];
+                                
+                                // Try each alternative selector
+                                for (const selector of alternativeSelectors) {
+                                    elements = document.querySelectorAll(selector);
+                                    if (elements && elements.length > 0) {
+                                        console.log(`Found results with selector: ${selector}`);
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (!elements || elements.length === 0) {
+                                // If still no results found, log the page structure for debugging
+                                console.log('Page structure:', document.body.innerHTML.substring(0, 1000));
+                                throw new Error('No search results found with any selector');
                             }
 
                             // Extract data from each result
                             return Array.from(elements).map((el) => {
-                                // Find required elements within result container
-                                const titleEl = el.querySelector('h3');            // Title element
-                                const linkEl = el.querySelector('a');              // Link element
-                                const snippetEl = el.querySelector('div.VwiC3b');  // Snippet element
-
-                                // Skip results missing required elements
-                                if (!titleEl || !linkEl || !snippetEl) {
+                                try {
+                                    // Try multiple selector patterns for each result element
+                                    // Title selectors
+                                    const titleSelectors = ['h3', 'h4', '[role="heading"]', '.LC20lb'];
+                                    let titleEl = null;
+                                    for (const selector of titleSelectors) {
+                                        titleEl = el.querySelector(selector);
+                                        if (titleEl) break;
+                                    }
+                                    
+                                    // Link selectors
+                                    const linkSelectors = ['a', 'a[ping]', 'a[href]', 'a[jsname]'];
+                                    let linkEl = null;
+                                    for (const selector of linkSelectors) {
+                                        linkEl = el.querySelector(selector);
+                                        if (linkEl) break;
+                                    }
+                                    
+                                    // Snippet selectors (description text)
+                                    const snippetSelectors = [
+                                        'div.VwiC3b', 'div[role="text"]', 'div[data-content-feature]',
+                                        'span.st', 'div.st', 'div.s', '.lyLwlc', 'span[jsname]'
+                                    ];
+                                    let snippetEl = null;
+                                    for (const selector of snippetSelectors) {
+                                        snippetEl = el.querySelector(selector);
+                                        if (snippetEl) break;
+                                    }
+                                    
+                                    // If no snippet found, try to get any text content from the element
+                                    if (!snippetEl) {
+                                        // Try to find any meaningful text content
+                                        const possibleSnippets = Array.from(el.querySelectorAll('div, span, p'))
+                                            .filter(node => 
+                                                node.textContent && 
+                                                node.textContent.trim().length > 20 &&
+                                                !node.querySelector('h3, h4')  // Not a container with a title
+                                            );
+                                        
+                                        if (possibleSnippets.length > 0) {
+                                            // Use the longest text as snippet
+                                            snippetEl = possibleSnippets.reduce((longest, current) => 
+                                                (current.textContent?.length || 0) > (longest.textContent?.length || 0) ? current : longest
+                                            );
+                                        }
+                                    }
+                                    
+                                    // Skip results missing required elements
+                                    if (!titleEl || !linkEl) {
+                                        return null;
+                                    }
+                                    
+                                    // Get URL (handle relative URLs)
+                                    let url = linkEl.getAttribute('href') || '';
+                                    if (url.startsWith('/url?') || url.startsWith('/search?')) {
+                                        // Extract actual URL from Google's redirect URL
+                                        const urlParams = new URLSearchParams(url.split('?')[1]);
+                                        const actualUrl = urlParams.get('q') || urlParams.get('url');
+                                        if (actualUrl) {
+                                            url = actualUrl;
+                                        }
+                                    }
+                                    
+                                    // Return structured result data with fallbacks
+                                    return {
+                                        title: titleEl.textContent?.trim() || 'Untitled Result',
+                                        url: url || '#',
+                                        snippet: snippetEl?.textContent?.trim() || 'No description available',
+                                    };
+                                } catch (e) {
+                                    console.log('Error extracting result:', e);
                                     return null;
                                 }
-
-                                // Return structured result data
-                                return {
-                                    title: titleEl.textContent || '',        // Result title
-                                    url: linkEl.getAttribute('href') || '',  // Result URL
-                                    snippet: snippetEl.textContent || '',    // Result description
-                                };
                             }).filter(result => result !== null);  // Remove invalid results
                         });
 
@@ -1198,16 +1282,118 @@ async function ensureBrowser(): Promise<Page> {
     if (!browser) {
         browser = await chromium.launch({
             headless: true,  // Run in headless mode for automation
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--window-size=1920,1080',
+                '--hide-scrollbars',
+                '--disable-notifications',
+                '--disable-extensions',
+                '--disable-infobars',
+                '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            ]
         });
 
-        // Create initial context and page
-        const context = await browser.newContext();
+        // Create initial context with more realistic browser settings
+        const context = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            ignoreHTTPSErrors: true,
+            javaScriptEnabled: true,
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
+            geolocation: { longitude: -74.006, latitude: 40.7128 }, // NYC coordinates
+            permissions: ['geolocation']
+        });
+        
+        // Add stealth plugins
+        await context.addInitScript(() => {
+            // Override navigator.webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+                configurable: true
+            });
+            
+            // Add plugins array
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    return [1, 2, 3, 4, 5].map(() => ({
+                        0: {
+                            type: 'application/x-google-chrome-pdf',
+                            description: 'Portable Document Format'
+                        },
+                        name: 'Chrome PDF Plugin',
+                        filename: 'internal-pdf-viewer',
+                        description: 'Portable Document Format',
+                        length: 1
+                    }));
+                }
+            });
+            
+            // Add language array
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+                configurable: true
+            });
+        });
+        
         page = await context.newPage();
     }
 
     // Create new page if current one is closed/invalid
     if (!page) {
-        const context = await browser.newContext();
+        // Create context with same stealth settings as initial launch
+        const context = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            ignoreHTTPSErrors: true,
+            javaScriptEnabled: true,
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
+            geolocation: { longitude: -74.006, latitude: 40.7128 }, // NYC coordinates
+            permissions: ['geolocation']
+        });
+        
+        // Add stealth plugins
+        await context.addInitScript(() => {
+            // Override navigator.webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+                configurable: true
+            });
+            
+            // Add plugins array
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    return [1, 2, 3, 4, 5].map(() => ({
+                        0: {
+                            type: 'application/x-google-chrome-pdf',
+                            description: 'Portable Document Format'
+                        },
+                        name: 'Chrome PDF Plugin',
+                        filename: 'internal-pdf-viewer',
+                        description: 'Portable Document Format',
+                        length: 1
+                    }));
+                }
+            });
+            
+            // Add language array
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+                configurable: true
+            });
+        });
+        
         page = await context.newPage();
     }
 
